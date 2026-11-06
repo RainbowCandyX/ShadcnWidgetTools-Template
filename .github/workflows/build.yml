@@ -1,0 +1,183 @@
+# 在 Windows / Linux / macOS 最新系统镜像上使用 Qt 6.12.0 编译并打包应用
+# 推送 vX.Y.Z tag 时把各平台压缩包发布到 GitHub Release；其他情况只上传构建产物
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  QT_VERSION: 6.12.0
+
+# 同一 ref 上的连续推送取消上一次未完成的运行
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # aqtinstall 3.3.0 无法读取 Qt 6.11 起 Windows 按架构拆分的仓库目录，修复（miurahr/aqtinstall#1000）尚未发布，固定到已合并该修复的提交
+          - name: Windows / MSVC 2022
+            os: windows-latest
+            qt_arch: win64_msvc2022_64
+            preset: msvc-release
+            aqt_source: git+https://github.com/miurahr/aqtinstall.git@5a49f2b391ae8ee1d3c0dd87f8b33c1d49a4deb7
+          - name: Linux / GCC
+            os: ubuntu-latest
+            qt_arch: linux_gcc_64
+            preset: linux-gcc-release
+            aqt_source: ''
+          - name: macOS / Clang
+            os: macos-latest
+            qt_arch: clang_64
+            preset: macos-release
+            aqt_source: ''
+
+    steps:
+      - name: Checkout 源码
+        uses: actions/checkout@v7
+
+      # Windows 上检出的文件为 CRLF 换行，正则不匹配行尾
+      - name: 读取应用名称与版本
+        id: app
+        shell: bash
+        run: |
+          set -euo pipefail
+          name=$(sed -n 's/^set(APP_NAME "\([^"]*\)").*/\1/p' CMakeLists.txt)
+          version=$(sed -n 's/^set(APP_VERSION "\([^"]*\)").*/\1/p' CMakeLists.txt)
+          if [ -z "$name" ] || [ -z "$version" ]; then
+            echo "::error::未能从 CMakeLists.txt 读取 APP_NAME 或 APP_VERSION"
+            exit 1
+          fi
+          # 版本 tag 必须与 APP_VERSION 一致
+          if [[ "$GITHUB_REF" == refs/tags/v* ]] && [ "v${version}" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME 与 CMakeLists.txt 中的 APP_VERSION ${version} 不一致"
+            exit 1
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: 安装 Linux 系统依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ninja-build libgl1-mesa-dev libglu1-mesa-dev libegl1 libvulkan-dev libfontconfig1 libdbus-1-3 libxkbcommon-dev libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-sync1 libxcb-xfixes0 libxcb-xinerama0 libxcb-xkb1
+
+      - name: 安装 Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      # qtshadertools 用于组件库图表的 GPU 绘制，Linguist Tools（界面翻译）已包含在基础安装中
+      - name: 安装 Qt ${{ env.QT_VERSION }}
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: ${{ matrix.qt_arch }}
+          target: desktop
+          modules: qtshadertools
+          aqtsource: ${{ matrix.aqt_source }}
+          cache: true
+          cache-key-prefix: qt-${{ env.QT_VERSION }}-${{ matrix.qt_arch }}
+
+      - name: 配置 MSVC 开发环境
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: CMake configure
+        shell: bash
+        run: cmake --preset ${{ matrix.preset }} -DQT_SDK_DIR="$QT_ROOT_DIR"
+
+      - name: CMake build
+        run: cmake --build --preset ${{ matrix.preset }} --parallel
+
+      # install 时由 Qt 部署脚本复制运行库（windeployqt / macdeployqt / Linux 通用部署）
+      - name: CMake install
+        run: cmake --install build/${{ matrix.preset }}
+
+      # 只打包运行所需文件
+      # Windows 的 Qt 插件已部署在 bin 中；Linux 的 qt.conf 以上级目录为前缀，plugins 需与 bin 同级；macOS 的运行库已由 macdeployqt 放入 .app
+      # 先打包再上传：upload-artifact 不保留可执行权限与符号链接，macOS framework 依赖符号链接
+      - name: 打包产物
+        id: package
+        shell: bash
+        env:
+          APP_NAME: ${{ steps.app.outputs.name }}
+          APP_VERSION: ${{ steps.app.outputs.version }}
+        run: |
+          set -euo pipefail
+          name="${APP_NAME}-${APP_VERSION}-${RUNNER_OS}"
+          src="install/${{ matrix.preset }}"
+          stage="package/${name}"
+          mkdir -p "$stage" dist
+          case "$RUNNER_OS" in
+            Windows)
+              cp -a "$src/bin" "$stage/"
+              ;;
+            Linux)
+              mkdir -p "$stage/lib"
+              cp -a "$src/bin" "$src/plugins" "$stage/"
+              cp -a "$src"/lib/*.so.* "$stage/lib/"
+              ;;
+            macOS)
+              cp -a "$src/${APP_NAME}.app" "$stage/"
+              ;;
+          esac
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            file="dist/${name}.zip"
+            (cd package && 7z a -tzip "../${file}" "${name}" > /dev/null)
+          else
+            file="dist/${name}.tar.gz"
+            tar -C package -czf "${file}" "${name}"
+          fi
+          ls -lh dist/
+          echo "file=${file}" >> "$GITHUB_OUTPUT"
+
+      # archive: false 直接上传压缩包，不再套一层 zip
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ steps.package.outputs.file }}
+          archive: false
+          retention-days: 14
+          if-no-files-found: error
+
+  release:
+    name: 发布到 GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      # skip-decompress 保持压缩包原样，否则 Windows 的 zip 会被自动解压
+      - name: 下载所有平台产物
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+          skip-decompress: true
+
+      - name: 创建 Release 并上传产物
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: |
+            基于 Qt ${{ env.QT_VERSION }} 自动构建，对应提交 `${{ github.sha }}`。
+
+            Windows 为 zip，Linux 与 macOS 为 tar.gz，各压缩包包含程序与对应平台的运行库。
+          fail_on_unmatched_files: true
+          files: dist/*
